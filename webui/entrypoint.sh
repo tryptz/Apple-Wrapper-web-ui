@@ -6,9 +6,10 @@ set -e
 
 if [ -n "${TAILSCALE_AUTHKEY}" ]; then
   echo "[tailscale] starting userspace daemon…"
+  # Distinct ports: pointing SOCKS and the HTTP proxy at 1055 made them collide.
   /usr/sbin/tailscaled \
     --tun=userspace-networking \
-    --socks5-server=localhost:1055 \
+    --socks5-server=localhost:1054 \
     --outbound-http-proxy-listen=localhost:1055 \
     --statedir=/tmp/tailscale &
 
@@ -26,11 +27,16 @@ if [ -n "${TAILSCALE_AUTHKEY}" ]; then
 
   echo "[tailscale] $(/usr/bin/tailscale ip -4 2>/dev/null || echo 'no address')"
 
-  # Route Node's outbound traffic through the tailnet proxy so plain
-  # fetch()/http.request to a 100.x address or MagicDNS name just works.
-  export ALL_PROXY="socks5://localhost:1055/"
-  export HTTP_PROXY="http://localhost:1055/"
-  export HTTPS_PROXY="http://localhost:1055/"
+  # IMPORTANT: Node does NOT honour HTTP_PROXY / ALL_PROXY. Unlike curl, its
+  # http.request has no implicit proxy support, so exporting these alone left
+  # every tailnet request failing with EHOSTUNREACH — userspace mode has no
+  # network interface to route through, so traffic MUST go via the proxy.
+  # server.js reads TS_HTTP_PROXY and proxies explicitly. The conventional
+  # vars stay exported for child processes that do respect them.
+  export TS_HTTP_PROXY="http://127.0.0.1:1055"
+  export ALL_PROXY="socks5://127.0.0.1:1054"
+  export HTTP_PROXY="http://127.0.0.1:1055"
+  export HTTPS_PROXY="http://127.0.0.1:1055"
   export NO_PROXY="localhost,127.0.0.1,.railway.internal"
 else
   echo "[tailscale] TAILSCALE_AUTHKEY not set — skipping tailnet"

@@ -25,6 +25,48 @@ const path = require('path');
 const AGENT_URL = (process.env.AGENT_URL || '').replace(/\/+$/, '');
 const PROXY_MODE = AGENT_URL !== '';
 
+// Tailscale in userspace mode creates no network interface, so a tailnet
+// address is unroutable from this process — connect() fails with EHOSTUNREACH.
+// Traffic has to go through tailscaled's outbound HTTP proxy. Node has no
+// implicit proxy support (HTTP_PROXY/ALL_PROXY are ignored by http.request),
+// so route through it explicitly, with no extra dependency: connect to the
+// proxy and use absolute-URI request form, which is exactly what an HTTP
+// proxy expects.
+const TS_PROXY = (() => {
+  const raw = process.env.TS_HTTP_PROXY || '';
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    return { host: u.hostname, port: Number(u.port) || 80 };
+  } catch {
+    console.warn(`[proxy] ignoring malformed TS_HTTP_PROXY: ${raw}`);
+    return null;
+  }
+})();
+
+/**
+ * Build http.request options for `target`, going via the tailnet proxy when
+ * one is configured. Without a proxy this is a plain direct request, so local
+ * (non-Railway) runs are unaffected.
+ */
+function requestOptionsFor(target, { method = 'GET', headers = {} } = {}) {
+  const hdrs = { ...headers, host: target.host };
+  if (!TS_PROXY || target.protocol !== 'http:') {
+    return { target, opts: { method, headers: hdrs } };
+  }
+  return {
+    target,
+    opts: {
+      host: TS_PROXY.host,
+      port: TS_PROXY.port,
+      method,
+      path: target.href,          // absolute-URI form for the proxy
+      headers: hdrs,
+    },
+    viaProxy: true,
+  };
+}
+
 const PORT = process.env.PORT || 8080;
 const ROOT = path.join(__dirname, '..');            // the wrapper repo root
 const DOWNLOADS_DIR = path.join(ROOT, 'downloads');
@@ -174,19 +216,15 @@ function proxyToAgent(req, res) {
   }
 
   const mod = target.protocol === 'https:' ? https : http;
-  const headers = { ...req.headers, host: target.host };
+  const headers = { ...req.headers };
   // Never let a proxied response arrive compressed — it would break the SSE
   // framing we pipe straight through.
   delete headers['accept-encoding'];
 
-  const upstream = mod.request(
-    target,
-    { method: req.method, headers },
-    (up) => {
-      res.writeHead(up.statusCode || 502, up.headers);
-      up.pipe(res);
-    },
-  );
+  const { opts, viaProxy } = requestOptionsFor(target, { method: req.method, headers });
+  const upstream = viaProxy
+    ? mod.request(opts, (up) => { res.writeHead(up.statusCode || 502, up.headers); up.pipe(res); })
+    : mod.request(target, opts, (up) => { res.writeHead(up.statusCode || 502, up.headers); up.pipe(res); });
 
   upstream.setTimeout(0);           // long-lived SSE streams must not time out
   upstream.on('error', (err) => {
@@ -209,14 +247,18 @@ function agentHealth() {
     catch { return resolve({ ok: false, detail: `AGENT_URL is malformed: ${AGENT_URL}` }); }
 
     const mod = target.protocol === 'https:' ? https : http;
-    const rq = mod.request(target, { method: 'GET', timeout: 4000 }, (up) => {
+    const { opts, viaProxy } = requestOptionsFor(target, { method: 'GET' });
+    const onRes = (up) => {
       up.resume();
       resolve(
         up.statusCode === 200
           ? { ok: true, detail: `Agent reachable at ${AGENT_URL}` }
           : { ok: false, detail: `Agent responded ${up.statusCode} at ${AGENT_URL}` },
       );
-    });
+    };
+    const rq = viaProxy
+      ? mod.request({ ...opts, timeout: 4000 }, onRes)
+      : mod.request(target, { ...opts, timeout: 4000 }, onRes);
     rq.on('timeout', () => { rq.destroy(); resolve({ ok: false, detail: `Timed out reaching ${AGENT_URL}` }); });
     rq.on('error', (e) => resolve({ ok: false, detail: `${e.code || e.message} — ${AGENT_URL}` }));
     rq.end();
@@ -394,11 +436,15 @@ const server = http.createServer(async (req, res) => {
         remote = await new Promise((resolve) => {
           const t = new URL('/api/setup/state', AGENT_URL);
           const mod = t.protocol === 'https:' ? https : http;
-          const rq = mod.request(t, { timeout: 5000 }, (up) => {
+          const { opts, viaProxy } = requestOptionsFor(t, { method: 'GET' });
+          const onRes = (up) => {
             let b = '';
             up.on('data', (d) => (b += d));
             up.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } });
-          });
+          };
+          const rq = viaProxy
+            ? mod.request({ ...opts, timeout: 5000 }, onRes)
+            : mod.request(t, { ...opts, timeout: 5000 }, onRes);
           rq.on('timeout', () => { rq.destroy(); resolve(null); });
           rq.on('error', () => resolve(null));
           rq.end();
