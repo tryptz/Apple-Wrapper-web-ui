@@ -12,6 +12,18 @@ const PORT = process.env.PORT || 8080;
 const ROOT = path.join(__dirname, '..');            // the wrapper repo root
 const DOWNLOADS_DIR = path.join(ROOT, 'downloads');
 
+// Onboarding: the two things a fresh clone does NOT ship (both gitignored).
+// rootfs/system holds the Android runtime libs the wrapper executes against;
+// rootfs/data holds the signed-in session. kvs.sqlitedb is the file
+// entrypoint.sh keys off to decide "already logged in?", so it is the single
+// source of truth for whether onboarding is complete.
+const ROOTFS_SYSTEM = path.join(ROOT, 'rootfs', 'system');
+const ROOTFS_DATA = path.join(ROOT, 'rootfs', 'data');
+const SESSION_DIR = path.join(
+  ROOTFS_DATA, 'data', 'com.apple.android.music', 'files'
+);
+const SESSION_DB = path.join(SESSION_DIR, 'mpl_db', 'kvs.sqlitedb');
+
 const WRAPPER_IMAGE = 'ghcr.io/worldobservationlog/wrapper:local';
 const DL_IMAGE = 'ghcr.io/zhaarey/apple-music-downloader:latest';
 // Must match `container_name` in compose.yaml — the web UI drives that single
@@ -131,6 +143,71 @@ async function startWrapper(username, password) {
   return composeRun(['up', '-d', COMPOSE_SERVICE], { USERNAME: username, PASSWORD: password });
 }
 
+// ---- onboarding / setup ----------------------------------------------------
+
+// Everything a new user needs before the app can do anything, each reported as
+// ok/not-ok with a human explanation. The UI renders this as a checklist and
+// only unlocks the main app once `ready` is true.
+async function setupState() {
+  const [dockerV, composeV] = await Promise.all([
+    dockerRun(['version', '--format', '{{.Server.Version}}']),
+    dockerRun(['compose', 'version', '--short']),
+  ]);
+
+  const dockerOk = dockerV.code === 0;
+  const composeOk = composeV.code === 0;
+
+  // A plausible rootfs has the dynamic linker + the Apple Music native lib.
+  const systemOk =
+    fs.existsSync(path.join(ROOTFS_SYSTEM, 'bin', 'linker64')) &&
+    fs.existsSync(path.join(ROOTFS_SYSTEM, 'lib64', 'libandroidappmusic.so'));
+
+  const sessionOk = fs.existsSync(SESSION_DB);
+  const { running, listening } = dockerOk ? await wrapperStatus() : { running: false, listening: false };
+
+  return {
+    ready: dockerOk && composeOk && systemOk && sessionOk,
+    steps: {
+      docker: {
+        ok: dockerOk,
+        detail: dockerOk
+          ? `Docker ${dockerV.out}`
+          : 'Docker not reachable. Install Docker Desktop and make sure it is running.',
+      },
+      compose: {
+        ok: composeOk,
+        detail: composeOk
+          ? `Compose ${composeV.out}`
+          : 'The `docker compose` plugin is missing (ships with Docker Desktop).',
+      },
+      rootfs: {
+        ok: systemOk,
+        detail: systemOk
+          ? 'Android runtime present'
+          : 'rootfs/system is missing. It is not distributed with this repo — copy it in from your own extraction.',
+      },
+      session: {
+        ok: sessionOk,
+        detail: sessionOk
+          ? 'Signed in — token stored in rootfs/data'
+          : 'No Apple Music session yet. Sign in below to create one.',
+      },
+    },
+    wrapper: { running, listening },
+  };
+}
+
+// Sign out = destroy the local session so a different Apple ID can be used, or
+// to recover from a corrupted/expired token. Only the app's own generated
+// session files are removed; rootfs/system is never touched.
+async function clearSession() {
+  await composeRun(['stop', COMPOSE_SERVICE]);   // release the SQLite locks first
+  if (fs.existsSync(SESSION_DIR)) {
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+  }
+  return !fs.existsSync(SESSION_DB);
+}
+
 // ---- download jobs ---------------------------------------------------------
 
 const jobs = new Map(); // id -> { id, url, format, buffer, clients, done, code, name }
@@ -220,10 +297,47 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, await wrapperStatus());
     }
 
+    if (p === '/api/setup/state' && req.method === 'GET') {
+      return sendJSON(res, 200, await setupState());
+    }
+
+    // First-time sign-in. Identical mechanics to /api/wrapper/start — the
+    // credentials are handed to `docker compose up` through the environment
+    // for that one invocation and are never written to disk by this server.
+    // Once the wrapper mints rootfs/data they are not needed again.
+    if (p === '/api/setup/login' && req.method === 'POST') {
+      const { username, password } = await readBody(req);
+      if (!username || !password) {
+        return sendJSON(res, 400, { error: 'Apple ID and password are required' });
+      }
+      const state = await setupState();
+      if (!state.steps.docker.ok) return sendJSON(res, 409, { error: state.steps.docker.detail });
+      if (!state.steps.rootfs.ok) return sendJSON(res, 409, { error: state.steps.rootfs.detail });
+
+      const r = await startWrapper(username, password);
+      if (r.code !== 0) return sendJSON(res, 500, { error: r.out });
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    if (p === '/api/setup/signout' && req.method === 'POST') {
+      const cleared = await clearSession();
+      return cleared
+        ? sendJSON(res, 200, { ok: true })
+        : sendJSON(res, 500, { error: 'Could not remove the session — stop the container and retry.' });
+    }
+
     if (p === '/api/wrapper/start' && req.method === 'POST') {
       const { username, password } = await readBody(req);
-      if (!username || !password) return sendJSON(res, 400, { error: 'username and password required' });
-      const r = await startWrapper(username, password);
+      // Credentials are only required for the very first login. Once the
+      // session exists in rootfs/data the wrapper reuses it, so a restart
+      // needs nothing — don't make the user re-enter a password to press play.
+      const haveSession = fs.existsSync(SESSION_DB);
+      if (!haveSession && (!username || !password)) {
+        return sendJSON(res, 400, {
+          error: 'No saved session yet — an Apple ID and password are required for the first sign-in.',
+        });
+      }
+      const r = await startWrapper(username || '', password || '');
       if (r.code !== 0) return sendJSON(res, 500, { error: r.out });
       return sendJSON(res, 200, { ok: true });
     }

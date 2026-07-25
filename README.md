@@ -37,15 +37,60 @@ they are not redistributed here.
 ### `downloads/` — ripped audio
 Output directory. Multi-gigabyte and copyrighted.
 
-## Running
+## Getting started (new users)
 
-Provide `rootfs/system/` and `rootfs/data/`, then:
+You do **not** need to hand-place a token or edit any config. Start the web UI
+and it walks you through setup:
+
+```bash
+node webui/server.js
+```
+
+Then open <http://localhost:8080>. On Windows, `Start Apple Music UI.bat` does
+the same thing.
+
+On first run a **setup wizard** opens automatically and checks four things
+live, re-testing whenever you hit *Re-check*:
+
+| Check | What it wants |
+|---|---|
+| Docker running | Docker Desktop installed and started |
+| Docker Compose | the `docker compose` plugin (ships with Desktop) |
+| Android runtime | `rootfs/system/` containing `bin/linker64` and `lib64/libandroidappmusic.so` |
+| Apple Music session | a signed-in session in `rootfs/data/` |
+
+Anything red shows what to do about it. Once the first three pass, a sign-in
+form appears: enter your Apple ID and the wizard starts the container, logs in,
+and waits for the session token to appear. When all four are green you're in.
+
+### About your password
+
+It is sent to the container for that single sign-in and **never written to
+disk** by the web UI, never stored in the browser, and never committed. Only
+the resulting session token is persisted, under `rootfs/data/`. The password
+field is cleared as soon as login is submitted.
+
+If your Apple ID has two-factor authentication, generate an
+[app-specific password](https://account.apple.com) and use that.
+
+After the first login no credentials are needed at all — the wrapper reuses the
+saved session, and the main screen's **Start wrapper** button takes no password.
+
+### Switching accounts / fixing a bad token
+
+Open **Setup → Sign out**. That stops the container and deletes the saved
+session so you can sign in as someone else. An expired or corrupted token
+("SSL token is invalid or expired") is fixed the same way. Downloaded files are
+never touched.
+
+## Running manually
+
+If you'd rather skip the UI, supply credentials via a local `.env` file next to
+`compose.yaml` (gitignored) and run compose directly:
 
 ```bash
 docker compose up --build
 ```
-
-On Windows, `Start Apple Music UI.bat` wraps the same thing.
 
 ## Note
 

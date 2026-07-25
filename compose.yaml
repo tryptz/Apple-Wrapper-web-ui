@@ -23,6 +23,8 @@ services:
       #   2. A local .env file next to this compose.yaml (gitignored):
       #        USERNAME=you@example.com
       #        PASSWORD=your-app-specific-password
-      # Once rootfs/data exists these are ignored entirely.
-      USERNAME: "${USERNAME:?set USERNAME via the setup wizard or a local .env file}"
-      PASSWORD: "${PASSWORD:?set PASSWORD via the setup wizard or a local .env file}"
+      # Default to empty rather than erroring: once rootfs/data exists no
+      # credentials are needed at all, and entrypoint.sh already fails with a
+      # clear message if they're missing on a first-ever login.
+      USERNAME: "${USERNAME:-}"
+      PASSWORD: "${PASSWORD:-}"
