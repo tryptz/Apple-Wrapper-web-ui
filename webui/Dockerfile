@@ -1,10 +1,8 @@
 # Web UI service (Railway).
 #
-# IMPORTANT: this builds with `webui/` itself as the build context, not the
-# repo root — deploy it with `railway up` run from inside webui/. The repo root
-# already has a Dockerfile (the wrapper), and Railway pins that one for a
-# GitHub-connected service regardless of RAILWAY_DOCKERFILE_PATH, so giving the
-# UI its own context is the only reliable way to build the right image.
+# CONTEXT: the repo ROOT, not webui/. `railway up` uploads the git repo root
+# no matter which directory it is invoked from, so paths here are repo-relative
+# and the service selects this file via RAILWAY_DOCKERFILE_PATH=webui/Dockerfile.
 #
 # Two differences from running the UI on your own machine:
 #   1. There is no Docker daemon here, so the UI cannot start/stop containers.
@@ -25,7 +23,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . /app/webui/
+COPY webui/ /app/webui/
 RUN chmod +x /app/webui/entrypoint.sh
 
 ENV PORT=8080
