@@ -374,13 +374,29 @@ async function refreshSetup({ autoOpen = false } = {}) {
     const agentOk = state.steps.agent && state.steps.agent.ok;
     const wrapperUp = state.wrapper && state.wrapper.listening;
 
+    const sup = state.supervisor;
     let msg = '', tone = 'ok';
     if (!agentOk) {
       msg = 'Your PC agent is offline — start it there, then reload.'; tone = 'no';
     } else if (!hasSession) {
       msg = 'Agent online, but it has no Apple Music session. Sign in on your PC.'; tone = 'no';
     } else if (!wrapperUp) {
-      msg = 'Agent online. Start the wrapper on your PC to enable downloads.'; tone = 'warn';
+      // Distinguish "gave up" from "will come back by itself" — otherwise a
+      // self-healing blip looks identical to a permanent failure.
+      if (sup && sup.paused) {
+        msg = 'Wrapper keeps stopping and auto-restart has given up. ' + (sup.lastReason || '');
+        tone = 'no';
+      } else if (sup && sup.enabled) {
+        msg = 'Wrapper is down — restarting automatically, this usually takes a few seconds.';
+        tone = 'warn';
+      } else {
+        msg = 'Agent online. Start the wrapper on your PC to enable downloads.';
+        tone = 'warn';
+      }
+    } else if (sup && sup.restarts > 0 && sup.lastReason) {
+      // Running, but it dropped recently — worth knowing, e.g. hitting the
+      // account's concurrent-stream limit.
+      msg = sup.lastReason; tone = 'warn';
     }
     $('banner').style.display = msg ? 'block' : 'none';
     $('banner').textContent = msg;

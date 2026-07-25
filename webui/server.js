@@ -388,6 +388,12 @@ async function setupState() {
       },
     },
     wrapper: { running, listening },
+    supervisor: {
+      enabled: supervisor.enabled,
+      paused: supervisor.paused,
+      restarts: recentRestarts(),
+      lastReason: supervisor.lastReason,
+    },
   };
 }
 
@@ -400,6 +406,77 @@ async function clearSession() {
     fs.rmSync(SESSION_DIR, { recursive: true, force: true });
   }
   return !fs.existsSync(SESSION_DB);
+}
+
+// ---- wrapper supervisor ----------------------------------------------------
+//
+// The wrapper exits cleanly (code 0) when Apple pulls its stream lease - e.g.
+// "More than one device is trying to play music" when the account's concurrent
+// stream limit is hit. Nothing crashes, so nothing restarts it, and downloads
+// silently stop working while every setup check still reports green. This
+// watches the container and brings it back.
+//
+// LOCAL mode only: proxy-mode instances have no Docker, and the agent they
+// forward to runs its own supervisor.
+// Set SUPERVISE_WRAPPER=0 to disable.
+
+const SUPERVISE = process.env.SUPERVISE_WRAPPER !== '0' && !PROXY_MODE;
+const SUPERVISE_INTERVAL_MS = 20_000;
+const MAX_RESTARTS = 5;              // within the window below
+const RESTART_WINDOW_MS = 15 * 60_000;
+
+const supervisor = {
+  enabled: SUPERVISE,
+  restarts: [],        // timestamps
+  lastReason: null,
+  paused: false,
+};
+
+function recentRestarts() {
+  const cutoff = Date.now() - RESTART_WINDOW_MS;
+  supervisor.restarts = supervisor.restarts.filter((t) => t > cutoff);
+  return supervisor.restarts.length;
+}
+
+async function superviseTick() {
+  if (!supervisor.enabled || supervisor.paused) return;
+  // Only meaningful once a session exists - without one the wrapper would just
+  // exit again demanding credentials, and restarting would be a hot loop.
+  if (!fs.existsSync(SESSION_DB)) return;
+
+  const insp = await dockerRun(['inspect', WRAPPER_NAME, '--format', '{{.State.Running}}|{{.State.ExitCode}}']);
+  if (insp.code !== 0) return;                       // container doesn't exist yet
+  const [running, exitCode] = insp.out.split('|');
+  if (running === 'true') return;
+
+  if (recentRestarts() >= MAX_RESTARTS) {
+    supervisor.paused = true;
+    supervisor.lastReason =
+      `Stopped after ${MAX_RESTARTS} restarts in 15 minutes - something is wrong, not restarting again.`;
+    console.warn(`[supervisor] ${supervisor.lastReason}`);
+    return;
+  }
+
+  // Surface WHY it went down; the Apple dialog is the common cause and is far
+  // more useful than a bare "container exited".
+  const logs = await dockerRun(['logs', '--tail', '40', WRAPPER_NAME]);
+  const dialog = /dialogHandler:\s*\{title:\s*([^,]+)/.exec(logs.out || '');
+  const reason = dialog ? dialog[1].trim() : `exit code ${exitCode}`;
+
+  supervisor.restarts.push(Date.now());
+  supervisor.lastReason = `Wrapper stopped (${reason}) - restarted automatically.`;
+  console.log(`[supervisor] wrapper down (${reason}); restarting (${recentRestarts()}/${MAX_RESTARTS})`);
+
+  const r = await startWrapper('', '');
+  if (r.code !== 0) {
+    supervisor.lastReason = `Wrapper stopped (${reason}); restart FAILED: ${r.out}`;
+    console.warn(`[supervisor] restart failed: ${r.out}`);
+  }
+}
+
+if (SUPERVISE) {
+  setInterval(() => { superviseTick().catch((e) => console.warn('[supervisor]', e)); },
+              SUPERVISE_INTERVAL_MS).unref();
 }
 
 // ---- download jobs ---------------------------------------------------------
@@ -554,6 +631,9 @@ const server = http.createServer(async (req, res) => {
         mode: 'proxy',
         steps,
         wrapper: remote ? remote.wrapper : { running: false, listening: false },
+        // Relay the agent's supervisor state so the remote UI can explain a
+        // wrapper that went down and came back on its own.
+        supervisor: remote ? remote.supervisor : null,
       });
     }
 
