@@ -15,8 +15,12 @@ RUN if [[ -f ./wrapper ]]; then \
         touch /use_prebuild; \
     fi
 
-RUN --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+# NOTE: `id=` is required by some BuildKit frontends (Railway's Metal builder
+# rejects an id-less cache mount outright: "missing an id argument"). Local
+# docker buildx derives an id from the target, so naming them is harmless here
+# and portable there.
+RUN --mount=type=cache,id=apt-lib,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
     if [[ ! -f /use_prebuild ]]; then \
         apt-get update; \
         apt-get install -y \
