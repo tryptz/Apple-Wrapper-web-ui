@@ -383,7 +383,10 @@ async function refreshSetup({ autoOpen = false } = {}) {
     } else if (!wrapperUp) {
       // Distinguish "gave up" from "will come back by itself" — otherwise a
       // self-healing blip looks identical to a permanent failure.
-      if (sup && sup.paused) {
+      if (sup && sup.manualStop) {
+        msg = 'Wrapper was stopped manually. Press Start on the agent to resume.';
+        tone = 'warn';
+      } else if (sup && sup.paused) {
         msg = 'Wrapper keeps stopping and auto-restart has given up. ' + (sup.lastReason || '');
         tone = 'no';
       } else if (sup && sup.enabled) {
@@ -393,7 +396,7 @@ async function refreshSetup({ autoOpen = false } = {}) {
         msg = 'Agent online. Start the wrapper on your PC to enable downloads.';
         tone = 'warn';
       }
-    } else if (sup && sup.restarts > 0 && sup.lastReason) {
+    } else if (sup && (sup.streamLimit > 0 || sup.faults > 0) && sup.lastReason) {
       // Running, but it dropped recently — worth knowing, e.g. hitting the
       // account's concurrent-stream limit.
       msg = sup.lastReason; tone = 'warn';

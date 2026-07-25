@@ -391,7 +391,9 @@ async function setupState() {
     supervisor: {
       enabled: supervisor.enabled,
       paused: supervisor.paused,
-      restarts: recentRestarts(),
+      manualStop: supervisor.manualStop,
+      streamLimit: pruneWindow(supervisor.streamLimit),
+      faults: pruneWindow(supervisor.faults),
       lastReason: supervisor.lastReason,
     },
   };
@@ -422,55 +424,101 @@ async function clearSession() {
 
 const SUPERVISE = process.env.SUPERVISE_WRAPPER !== '0' && !PROXY_MODE;
 const SUPERVISE_INTERVAL_MS = 20_000;
-const MAX_RESTARTS = 5;              // within the window below
-const RESTART_WINDOW_MS = 15 * 60_000;
+
+// Two independent budgets, because the two causes mean opposite things.
+//
+// Apple pulling the stream lease ("More than one device is trying to play
+// music") is EXPECTED when several people share the account - it is not a
+// broken wrapper, and giving up would be the wrong response. It gets a large
+// budget and only a short backoff.
+//
+// An unexplained exit is a real fault. It gets a small budget and exponential
+// backoff, so a wrapper that genuinely cannot start is not hot-looped.
+const STREAM_LIMIT_MAX = 40;
+const FAULT_MAX = 5;
+const BUDGET_WINDOW_MS = 15 * 60_000;
+const BACKOFF_BASE_MS = 8_000;
+const BACKOFF_MAX_MS = 2 * 60_000;
 
 const supervisor = {
   enabled: SUPERVISE,
-  restarts: [],        // timestamps
+  manualStop: false,     // set when a user presses Stop - never fight that
+  restarting: false,     // in-flight guard: no concurrent `compose up`
+  streamLimit: [],       // timestamps, benign cause
+  faults: [],            // timestamps, real cause
+  backoffUntil: 0,
+  consecutiveFaults: 0,
   lastReason: null,
   paused: false,
 };
 
-function recentRestarts() {
-  const cutoff = Date.now() - RESTART_WINDOW_MS;
-  supervisor.restarts = supervisor.restarts.filter((t) => t > cutoff);
-  return supervisor.restarts.length;
+function pruneWindow(list) {
+  const cutoff = Date.now() - BUDGET_WINDOW_MS;
+  while (list.length && list[0] <= cutoff) list.shift();
+  return list.length;
 }
 
 async function superviseTick() {
   if (!supervisor.enabled || supervisor.paused) return;
-  // Only meaningful once a session exists - without one the wrapper would just
-  // exit again demanding credentials, and restarting would be a hot loop.
+  // A deliberate Stop must stick. Restarting over the top of it was the most
+  // useless thing this could do: the user presses Stop, it comes back 20s later.
+  if (supervisor.manualStop) return;
+  if (supervisor.restarting) return;
+  if (Date.now() < supervisor.backoffUntil) return;
+  // Without a session the wrapper would just exit demanding credentials.
   if (!fs.existsSync(SESSION_DB)) return;
 
   const insp = await dockerRun(['inspect', WRAPPER_NAME, '--format', '{{.State.Running}}|{{.State.ExitCode}}']);
-  if (insp.code !== 0) return;                       // container doesn't exist yet
+  if (insp.code !== 0) return;                       // container not created yet
   const [running, exitCode] = insp.out.split('|');
-  if (running === 'true') return;
-
-  if (recentRestarts() >= MAX_RESTARTS) {
-    supervisor.paused = true;
-    supervisor.lastReason =
-      `Stopped after ${MAX_RESTARTS} restarts in 15 minutes - something is wrong, not restarting again.`;
-    console.warn(`[supervisor] ${supervisor.lastReason}`);
+  if (running === 'true') {
+    supervisor.consecutiveFaults = 0;                // healthy again
     return;
   }
 
-  // Surface WHY it went down; the Apple dialog is the common cause and is far
-  // more useful than a bare "container exited".
+  // Why did it stop? Apple's dialog is far more useful than a bare exit code.
   const logs = await dockerRun(['logs', '--tail', '40', WRAPPER_NAME]);
   const dialog = /dialogHandler:\s*\{title:\s*([^,]+)/.exec(logs.out || '');
-  const reason = dialog ? dialog[1].trim() : `exit code ${exitCode}`;
+  const title = dialog ? dialog[1].trim() : '';
+  const isStreamLimit = /more than one device|stream/i.test(title);
+  const reason = title || `exit code ${exitCode}`;
 
-  supervisor.restarts.push(Date.now());
-  supervisor.lastReason = `Wrapper stopped (${reason}) - restarted automatically.`;
-  console.log(`[supervisor] wrapper down (${reason}); restarting (${recentRestarts()}/${MAX_RESTARTS})`);
+  if (isStreamLimit) {
+    supervisor.streamLimit.push(Date.now());
+    if (pruneWindow(supervisor.streamLimit) > STREAM_LIMIT_MAX) {
+      supervisor.paused = true;
+      supervisor.lastReason =
+        'Apple keeps ending the stream lease - too many devices are playing at once. Not restarting again.';
+      return;
+    }
+    supervisor.consecutiveFaults = 0;
+    supervisor.backoffUntil = Date.now() + BACKOFF_BASE_MS;
+    supervisor.lastReason = `Apple ended the stream lease (${reason}) - restarted automatically.`;
+  } else {
+    supervisor.faults.push(Date.now());
+    if (pruneWindow(supervisor.faults) > FAULT_MAX) {
+      supervisor.paused = true;
+      supervisor.lastReason =
+        `Wrapper failed ${FAULT_MAX} times in 15 minutes (${reason}) - not restarting again.`;
+      console.warn(`[supervisor] ${supervisor.lastReason}`);
+      return;
+    }
+    supervisor.consecutiveFaults += 1;
+    supervisor.backoffUntil = Date.now()
+      + Math.min(BACKOFF_BASE_MS * 2 ** (supervisor.consecutiveFaults - 1), BACKOFF_MAX_MS);
+    supervisor.lastReason = `Wrapper stopped (${reason}) - restarted automatically.`;
+  }
 
-  const r = await startWrapper('', '');
-  if (r.code !== 0) {
-    supervisor.lastReason = `Wrapper stopped (${reason}); restart FAILED: ${r.out}`;
-    console.warn(`[supervisor] restart failed: ${r.out}`);
+  console.log(`[supervisor] wrapper down (${reason}); restarting`);
+  supervisor.restarting = true;
+  try {
+    const r = await startWrapper('', '');
+    if (r.code !== 0) {
+      supervisor.lastReason = `Wrapper stopped (${reason}); restart FAILED: ${r.out}`;
+      console.warn(`[supervisor] restart failed: ${r.out}`);
+    }
+  } finally {
+    supervisor.restarting = false;
   }
 }
 
@@ -677,13 +725,21 @@ const server = http.createServer(async (req, res) => {
           error: 'No saved session yet — an Apple ID and password are required for the first sign-in.',
         });
       }
+      // An explicit start clears the manual-stop latch and any give-up state,
+      // so the supervisor resumes looking after it from here.
+      supervisor.manualStop = false;
+      supervisor.paused = false;
+      supervisor.backoffUntil = 0;
+      supervisor.consecutiveFaults = 0;
       const r = await startWrapper(username || '', password || '');
       if (r.code !== 0) return sendJSON(res, 500, { error: r.out });
       return sendJSON(res, 200, { ok: true });
     }
 
     if (p === '/api/wrapper/stop' && req.method === 'POST') {
-      // Stop the compose-managed container (keeps it defined for a fast restart).
+      // Latch the intent BEFORE stopping, so the supervisor can't race in and
+      // restart what the user just asked to stop.
+      supervisor.manualStop = true;
       await composeRun(['stop', COMPOSE_SERVICE]);
       return sendJSON(res, 200, { ok: true });
     }
