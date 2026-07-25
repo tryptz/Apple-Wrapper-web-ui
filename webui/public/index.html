@@ -269,7 +269,7 @@ function streamInto(sseUrl, el, { clear = true } = {}) {
 
 // Extra guidance the server can't infer — what to actually DO about a red check.
 const FIXES = {
-  agent: 'Start the agent on your own machine (node webui/server.js) and make sure both it and this service are on the same tailnet. Then check AGENT_URL points at that machine, e.g. http://100.x.y.z:8080',
+  agent: 'Start the agent on your own machine, and make sure both it and this service are on the same tailnet. Then check the AGENT_URL variable points at that machine.',
   docker: 'Install Docker Desktop from docker.com, launch it, and wait for the whale icon to settle.',
   compose: 'Bundled with Docker Desktop. On Linux: sudo apt install docker-compose-plugin',
   rootfs: 'Copy your extracted Android runtime into rootfs/system/ — it must contain bin/linker64 and lib64/libandroidappmusic.so. It is not redistributed with this repo.',

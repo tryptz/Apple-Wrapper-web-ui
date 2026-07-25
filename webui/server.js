@@ -121,8 +121,67 @@ function composeRun(args, env) {
   return dockerRun(['compose', ...args], { cwd: ROOT, env });
 }
 
+// ---- redaction --------------------------------------------------------------
+//
+// This UI can be served from a PUBLIC URL (the Railway deployment), while the
+// data flowing through it comes from a private machine: tailnet addresses, the
+// Apple Music token the wrapper prints on every start, auth keys. None of that
+// should ever reach a browser. Redaction happens at the OUTPUT boundary — every
+// JSON body, every SSE event, and every proxied text stream — so it cannot be
+// bypassed by calling the API directly instead of using the page.
+
+const REDACTIONS = [
+  // Apple Music token as the wrapper logs it.
+  [/(Music-Token\s*:\s*)\S+/gi, '$1[redacted]'],
+  // Tailscale auth keys / OAuth client secrets.
+  [/\b(tskey-[A-Za-z0-9-]{4})[A-Za-z0-9-]+/g, '$1[redacted]'],
+  // Generic secret-bearing assignments: token=, authkey:, password = "…"
+  [/\b(authkey|auth_key|api[-_]?key|secret|password|passwd|pwd|token)(\s*[:=]\s*"?)([^"\s,&}]{3,})/gi,
+   '$1$2[redacted]'],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 [redacted]'],
+  // Any IPv4 (with optional port). Loopback/wildcard reveal nothing about the
+  // network, so they stay readable — useful when reading logs.
+  [/\b(?!0\.0\.0\.0\b)(?!127\.0\.0\.1\b)(?:\d{1,3}\.){3}\d{1,3}\b(?::\d{1,5})?/g, '[hidden]'],
+  // Apple IDs / e-mail addresses.
+  [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[hidden]'],
+];
+
+function redact(text) {
+  if (typeof text !== 'string' || text === '') return text;
+  let out = text;
+  for (const [re, to] of REDACTIONS) out = out.replace(re, to);
+  return out;
+}
+
+/**
+ * Line-buffered redacting transform for piped streams. Buffering to line
+ * boundaries matters: a token split across two chunks would otherwise slip
+ * through with each half individually looking harmless.
+ */
+const { Transform } = require('stream');
+function redactStream() {
+  let tail = '';
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      const s = tail + chunk.toString('utf8');
+      const idx = s.lastIndexOf('\n');
+      if (idx === -1) { tail = s; return cb(); }
+      tail = s.slice(idx + 1);
+      cb(null, redact(s.slice(0, idx + 1)));
+    },
+    flush(cb) { cb(null, tail ? redact(tail) : undefined); },
+  });
+}
+
+// Only text is safe to rewrite — running a regex over a downloaded .m4a would
+// corrupt it.
+function isRedactableType(headers) {
+  const ct = String(headers['content-type'] || '').toLowerCase();
+  return ct.includes('text/') || ct.includes('json') || ct.includes('event-stream');
+}
+
 function sendJSON(res, status, obj) {
-  const body = JSON.stringify(obj);
+  const body = redact(JSON.stringify(obj));
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
@@ -157,7 +216,7 @@ function openSSE(res) {
 
 function sseSend(res, event, data) {
   res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  res.write(`data: ${redact(JSON.stringify(data))}\n\n`);
 }
 
 // ---- wrapper container management ------------------------------------------
@@ -221,17 +280,28 @@ function proxyToAgent(req, res) {
   // framing we pipe straight through.
   delete headers['accept-encoding'];
 
+  // Proxied bodies bypass sendJSON/sseSend entirely, so they get their own
+  // redaction pass — this is the path the wrapper's log stream (and its
+  // Music-Token) actually travels.
+  const onUpstream = (up) => {
+    const h = { ...up.headers };
+    if (isRedactableType(h)) delete h['content-length'];   // length changes
+    res.writeHead(up.statusCode || 502, h);
+    if (isRedactableType(h)) up.pipe(redactStream()).pipe(res);
+    else up.pipe(res);
+  };
+
   const { opts, viaProxy } = requestOptionsFor(target, { method: req.method, headers });
   const upstream = viaProxy
-    ? mod.request(opts, (up) => { res.writeHead(up.statusCode || 502, up.headers); up.pipe(res); })
-    : mod.request(target, opts, (up) => { res.writeHead(up.statusCode || 502, up.headers); up.pipe(res); });
+    ? mod.request(opts, onUpstream)
+    : mod.request(target, opts, onUpstream);
 
   upstream.setTimeout(0);           // long-lived SSE streams must not time out
   upstream.on('error', (err) => {
     if (res.headersSent) return res.end();
     sendJSON(res, 502, {
       error:
-        `Cannot reach the wrapper agent at ${AGENT_URL} (${err.code || err.message}). ` +
+        `Cannot reach the wrapper agent (${err.code || 'connection failed'}). ` +
         `Check that the agent is running on your machine and that this service is on the tailnet.`,
     });
   });
@@ -250,17 +320,19 @@ function agentHealth() {
     const { opts, viaProxy } = requestOptionsFor(target, { method: 'GET' });
     const onRes = (up) => {
       up.resume();
+      // Deliberately no address in user-facing text — the operator already
+      // knows which machine this is, and this page may be publicly served.
       resolve(
         up.statusCode === 200
-          ? { ok: true, detail: `Agent reachable at ${AGENT_URL}` }
-          : { ok: false, detail: `Agent responded ${up.statusCode} at ${AGENT_URL}` },
+          ? { ok: true, detail: 'Agent reachable' }
+          : { ok: false, detail: `Agent responded ${up.statusCode}` },
       );
     };
     const rq = viaProxy
       ? mod.request({ ...opts, timeout: 4000 }, onRes)
       : mod.request(target, { ...opts, timeout: 4000 }, onRes);
-    rq.on('timeout', () => { rq.destroy(); resolve({ ok: false, detail: `Timed out reaching ${AGENT_URL}` }); });
-    rq.on('error', (e) => resolve({ ok: false, detail: `${e.code || e.message} — ${AGENT_URL}` }));
+    rq.on('timeout', () => { rq.destroy(); resolve({ ok: false, detail: 'Timed out reaching your PC agent' }); });
+    rq.on('error', (e) => resolve({ ok: false, detail: `Cannot reach your PC agent (${e.code || 'error'})` }));
     rq.end();
   });
 }
@@ -585,6 +657,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Apple Music web UI running at http://localhost:${PORT}`);
   if (PROXY_MODE) {
+    // Server-side console only (never shown in the browser), so the address is
+    // fine here and is genuinely useful for debugging a deploy.
     console.log(`Mode: PROXY — forwarding /api and /files to ${AGENT_URL}`);
     console.log('No Docker is used by this process; the agent does the work.');
   } else {
