@@ -532,15 +532,43 @@ if (SUPERVISE) {
 const jobs = new Map(); // id -> { id, url, format, buffer, clients, done, code, name }
 let jobSeq = 0;
 
+// Unique per agent process, so download container names can't collide with
+// leftovers from a previous run.
+const RUN_TAG = Math.random().toString(36).slice(2, 8);
+
+// Reap download containers orphaned by a previous agent (a stuck retry loop
+// survives the agent exiting, and each one keeps burning CPU and holding an
+// Apple stream). Only touches am-dl-* — never the wrapper.
+async function reapOrphanDownloaders() {
+  const r = await dockerRun(['ps', '-aq', '--filter', 'name=am-dl-']);
+  const ids = r.out.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!ids.length) return;
+  console.log(`[cleanup] removing ${ids.length} orphaned downloader container(s)`);
+  await dockerRun(['rm', '-f', ...ids]);
+}
+
 const FORMAT_FLAGS = {
   alac: [],
   atmos: ['--atmos'],
   aac: ['--aac'],
 };
 
+// The downloader prompts "Error detected, press Enter to try again..." on
+// failure. With no TTY it never gets an Enter, so it retries forever: the
+// container never exits, holds ~27% CPU and keeps an Apple stream open.
+// Several of those at once is what trips the account's concurrent-stream
+// limit and takes the wrapper down with it.
+const RETRY_LOOP_MARKER = /Error detected, press Enter to try again|Start trying again/i;
+const RETRY_LOOP_LIMIT = 3;          // strikes before we call it stuck
+const JOB_MAX_MS = 30 * 60_000;      // absolute ceiling per job
+
 function startDownload(url, format) {
   const id = String(++jobSeq);
-  const name = `am-dl-${id}`;
+  // jobSeq restarts at 1 whenever the agent restarts, so `am-dl-<id>` alone
+  // collides with a container left over from a previous run ("name is already
+  // in use", exit 125). A per-process suffix keeps names unique across
+  // restarts and concurrent users.
+  const name = `am-dl-${id}-${RUN_TAG}`;
   const flags = FORMAT_FLAGS[format] || [];
   const args = [
     'run', '--rm', '--network', 'host', '--name', name,
@@ -549,25 +577,48 @@ function startDownload(url, format) {
     ...flags,
     url,
   ];
-  const job = { id, url, format, buffer: [], clients: new Set(), done: false, code: null, name };
+  const job = {
+    id, url, format, buffer: [], clients: new Set(), done: false, code: null, name,
+    retryStrikes: 0, killed: null,
+  };
   jobs.set(id, job);
+
+  const abort = (why) => {
+    if (job.done || job.killed) return;
+    job.killed = why;
+    push(`\n!! ${why} — stopping this job so it stops holding a stream.`);
+    dockerRun(['rm', '-f', name]);
+  };
 
   const push = (line) => {
     job.buffer.push(line);
     if (job.buffer.length > 2000) job.buffer.shift();
     for (const c of job.clients) sseSend(c, 'log', line);
+
+    // Break the infinite retry loop rather than let it run forever.
+    if (RETRY_LOOP_MARKER.test(line)) {
+      job.retryStrikes += 1;
+      if (job.retryStrikes >= RETRY_LOOP_LIMIT) {
+        abort(`Downloader stuck retrying (${job.retryStrikes}x) — the URL is probably unavailable in this storefront`);
+      }
+    }
   };
   push(`$ docker ${args.join(' ')}`);
+
+  // Hard ceiling regardless of what the logs say.
+  const killTimer = setTimeout(() => abort(`Job exceeded ${JOB_MAX_MS / 60000} minutes`), JOB_MAX_MS);
+  killTimer.unref();
 
   const p = docker(args);
   const onData = (d) => String(d).split(/\r?\n/).forEach((l) => l !== '' && push(l));
   p.stdout.on('data', onData);
   p.stderr.on('data', onData);
   p.on('close', (code) => {
+    clearTimeout(killTimer);
     job.done = true;
     job.code = code;
-    push(`\n=== job finished (exit ${code}) ===`);
-    for (const c of job.clients) sseSend(c, 'done', { code });
+    push(job.killed ? `\n=== job stopped: ${job.killed} ===` : `\n=== job finished (exit ${code}) ===`);
+    for (const c of job.clients) sseSend(c, 'done', { code, killed: job.killed || null });
   });
   p.on('error', (err) => {
     job.done = true;
@@ -823,5 +874,6 @@ server.listen(PORT, () => {
   } else {
     console.log('Mode: LOCAL — driving Docker directly');
     console.log(`Repo root: ${ROOT}`);
+    reapOrphanDownloaders().catch((e) => console.warn('[cleanup]', e));
   }
 });
