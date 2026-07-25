@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="112" fill="#17171c"/>
+  <rect x="8" y="8" width="496" height="496" rx="106" fill="none" stroke="#26262e" stroke-width="16"/>
+  <!-- music note -->
+  <g fill="#fa2d48">
+    <path d="M330 96c-6 0-11 4-12 10l-24 148a58 58 0 1 0 24 46V190l66-14a12 12 0 0 0 10-12v-56a12 12 0 0 0-14-12z"/>
+  </g>
+  <!-- download arrow -->
+  <g stroke="#e8e8ea" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M150 250v96"/>
+    <path d="M112 310l38 40 38-40"/>
+    <path d="M104 400h92"/>
+  </g>
+</svg>

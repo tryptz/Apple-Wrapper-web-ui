@@ -482,9 +482,32 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (p === '/' || p === '/index.html') {
-      const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // Fill in {{ORIGIN}} so the Open Graph url/image are absolute — link
+      // crawlers (Discord, Slack, iMessage) reject relative ones, and the
+      // origin differs between the local agent and the public deployment.
+      // x-forwarded-proto is what Railway's TLS terminator sets.
+      const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
+        || (req.socket.encrypted ? 'https' : 'http');
+      const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+      const origin = `${proto}://${host}`;
+
+      const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8')
+        .split('{{ORIGIN}}').join(origin);
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html),
+      });
       return res.end(html);
+    }
+
+    if (p === '/icon.svg') {
+      const svg = fs.readFileSync(path.join(__dirname, 'public', 'icon.svg'));
+      res.writeHead(200, {
+        'Content-Type': 'image/svg+xml',
+        'Cache-Control': 'public, max-age=86400',
+        'Content-Length': svg.length,
+      });
+      return res.end(svg);
     }
 
     // Proxy mode: everything with side effects belongs to the agent. This must

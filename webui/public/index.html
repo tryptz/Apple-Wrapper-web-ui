@@ -4,6 +4,30 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Apple Music Downloader</title>
+
+<!-- Link preview (Discord, Slack, iMessage, etc.). Discord builds its embed
+     from these Open Graph tags and takes the accent bar from theme-color.
+     Deliberately says nothing about the host machine, its address or the
+     account - this page is served from a public URL. {{ORIGIN}} is filled in
+     by the server so og:url/og:image are absolute, which crawlers require. -->
+<meta name="description" content="Paste an Apple Music link, pick a format, download it." />
+<meta name="theme-color" content="#fa2d48" />
+
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Apple Music Downloader" />
+<meta property="og:title" content="Apple Music Downloader" />
+<meta property="og:description" content="Paste an Apple Music link, pick a format (ALAC / Dolby Atmos / AAC), and download it. Private remote control for your own library." />
+<meta property="og:url" content="{{ORIGIN}}/" />
+<meta property="og:image" content="{{ORIGIN}}/icon.svg" />
+<meta property="og:image:type" content="image/svg+xml" />
+<meta property="og:image:width" content="512" />
+<meta property="og:image:height" content="512" />
+
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Apple Music Downloader" />
+<meta name="twitter:description" content="Paste a link, pick a format, download." />
+
+<link rel="icon" href="/icon.svg" type="image/svg+xml" />
 <style>
   :root {
     --bg: #0d0d10; --card: #17171c; --line: #26262e; --fg: #e8e8ea;
