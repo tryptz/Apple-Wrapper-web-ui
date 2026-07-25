@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Apple Music Downloader</title>
+<style>
+  :root {
+    --bg: #0d0d10; --card: #17171c; --line: #26262e; --fg: #e8e8ea;
+    --muted: #9a9aa5; --accent: #fa2d48; --ok: #33c26a; --warn: #e0a83b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 24px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #555; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.warn { background: var(--warn); }
+  #statusText { color: var(--muted); font-size: 13px; }
+  main {
+    max-width: 1100px; margin: 0 auto; padding: 24px;
+    display: grid; gap: 20px; grid-template-columns: 1fr 1fr;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px 20px;
+  }
+  .card.wide { grid-column: 1 / -1; }
+  h2 { font-size: 15px; margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, select {
+    width: 100%; padding: 9px 11px; background: #0f0f13; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  button {
+    margin-top: 14px; padding: 9px 16px; border: none; border-radius: 8px;
+    background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
+    cursor: pointer;
+  }
+  button.ghost { background: #24242c; color: var(--fg); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  pre {
+    background: #08080a; border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; margin: 12px 0 0; max-height: 300px; overflow: auto;
+    font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+    color: #cfcfd6;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td a { color: var(--accent); text-decoration: none; }
+  .size { color: var(--muted); white-space: nowrap; }
+  .tag {
+    display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 11px;
+    background: #24242c; color: var(--muted);
+  }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Apple Music Downloader</h1>
+  <span id="statusText">checking…</span>
+</header>
+
+<main>
+  <!-- Credentials / wrapper -->
+  <section class="card">
+    <h2>1 · Apple Music account</h2>
+    <label>Apple ID (email)</label>
+    <input id="user" type="text" autocomplete="username" placeholder="you@example.com" />
+    <label>Password</label>
+    <input id="pass" type="password" autocomplete="current-password" placeholder="••••••••" />
+    <div class="row">
+      <button id="startBtn">Start wrapper</button>
+      <button id="stopBtn" class="ghost">Stop</button>
+    </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0">
+      Logs in and starts the decryption service (ports 10020/20020/30020).
+      Only needed once per session.
+    </p>
+    <pre id="wrapLog">wrapper logs will appear here…</pre>
+  </section>
+
+  <!-- Download -->
+  <section class="card">
+    <h2>2 · Download a track / album</h2>
+    <label>Apple Music URL</label>
+    <input id="url" type="text" placeholder="https://music.apple.com/us/song/…" />
+    <label>Format</label>
+    <select id="format">
+      <option value="alac">ALAC — lossless / hi-res</option>
+      <option value="atmos">Dolby Atmos (EC-3)</option>
+      <option value="aac">AAC</option>
+    </select>
+    <button id="dlBtn">Download</button>
+    <p class="muted" style="font-size:12px;margin:10px 0 0">
+      The wrapper must be listening (green dot) first.
+    </p>
+    <pre id="jobLog">download output will appear here…</pre>
+  </section>
+
+  <!-- Files -->
+  <section class="card wide">
+    <h2>3 · Downloaded files <button id="refreshBtn" class="ghost" style="margin:0 0 0 8px;padding:4px 10px;font-size:12px">Refresh</button></h2>
+    <table>
+      <thead><tr><th>File</th><th>Format</th><th class="size">Size</th><th></th></tr></thead>
+      <tbody id="fileRows"><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function setStatus(s) {
+  const dot = $('dot'), txt = $('statusText');
+  dot.className = 'dot';
+  if (!s.running) { txt.textContent = 'wrapper stopped'; }
+  else if (s.listening) { dot.classList.add('on'); txt.textContent = 'wrapper listening'; }
+  else { dot.classList.add('warn'); txt.textContent = 'wrapper starting…'; }
+}
+
+async function refreshStatus() {
+  try { setStatus(await (await fetch('/api/status')).json()); } catch {}
+}
+
+function streamInto(sseUrl, el, { clear = true } = {}) {
+  if (clear) el.textContent = '';
+  const es = new EventSource(sseUrl);
+  es.addEventListener('log', (e) => {
+    el.textContent += JSON.parse(e.data) + '\n';
+    el.scrollTop = el.scrollHeight;
+  });
+  es.addEventListener('done', () => { es.close(); refreshStatus(); refreshFiles(); });
+  es.onerror = () => es.close();
+  return es;
+}
+
+$('startBtn').onclick = async () => {
+  const username = $('user').value.trim(), password = $('pass').value;
+  if (!username || !password) return alert('Enter Apple ID and password');
+  $('startBtn').disabled = true;
+  const r = await fetch('/api/wrapper/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  $('startBtn').disabled = false;
+  const data = await r.json();
+  if (!r.ok) return alert('Failed: ' + (data.error || r.status));
+  // give the container a moment, then tail logs + poll status
+  setTimeout(() => streamInto('/api/wrapper/logs', $('wrapLog')), 800);
+  const poll = setInterval(refreshStatus, 1500);
+  setTimeout(() => clearInterval(poll), 30000);
+};
+
+$('stopBtn').onclick = async () => {
+  await fetch('/api/wrapper/stop', { method: 'POST' });
+  refreshStatus();
+};
+
+$('dlBtn').onclick = async () => {
+  const url = $('url').value.trim(), format = $('format').value;
+  if (!url) return alert('Paste an Apple Music URL');
+  $('dlBtn').disabled = true;
+  const r = await fetch('/api/download', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, format }),
+  });
+  $('dlBtn').disabled = false;
+  const data = await r.json();
+  if (!r.ok) return alert('Failed: ' + (data.error || r.status));
+  streamInto('/api/jobs/' + data.id + '/stream', $('jobLog'));
+};
+
+function fmtSize(n) {
+  if (n > 1e6) return (n / 1e6).toFixed(1) + ' MB';
+  if (n > 1e3) return (n / 1e3).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+async function refreshFiles() {
+  const rows = $('fileRows');
+  try {
+    const files = await (await fetch('/api/files')).json();
+    if (!files.length) { rows.innerHTML = '<tr><td colspan="4" class="muted">no downloads yet</td></tr>'; return; }
+    rows.innerHTML = files.map((f) => {
+      const fmt = f.path.split('/')[0];
+      const name = f.path.split('/').slice(1).join('/') || f.path;
+      const href = '/files/download?path=' + encodeURIComponent(f.path);
+      return `<tr><td>${name}</td><td><span class="tag">${fmt}</span></td>`
+        + `<td class="size">${fmtSize(f.size)}</td>`
+        + `<td><a href="${href}">download ⭳</a></td></tr>`;
+    }).join('');
+  } catch { rows.innerHTML = '<tr><td colspan="4" class="muted">error loading</td></tr>'; }
+}
+
+$('refreshBtn').onclick = refreshFiles;
+
+refreshStatus();
+refreshFiles();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>

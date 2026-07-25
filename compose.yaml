@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET_ARCH: amd64
+        NDK_VERSION: 23
+    # Fixed name so the web UI (webui/server.js) can drive this single container
+    # instead of spawning its own. One launcher => no double-instance DB races.
+    container_name: am-wrapper
+    privileged: true
+    network_mode: host
+    volumes:
+      - ./rootfs/data:/app/rootfs/data
+    environment:
+      # Apple ID used ONLY for the first login, to mint the session in
+      # rootfs/data. Never hardcode credentials here — this file is committed.
+      # Supply them one of two ways:
+      #   1. The web UI's setup wizard (recommended) — it passes them through
+      #      the environment for a single `docker compose up` and never writes
+      #      them to disk.
+      #   2. A local .env file next to this compose.yaml (gitignored):
+      #        USERNAME=you@example.com
+      #        PASSWORD=your-app-specific-password
+      # Once rootfs/data exists these are ignored entirely.
+      USERNAME: "${USERNAME:?set USERNAME via the setup wizard or a local .env file}"
+      PASSWORD: "${PASSWORD:?set PASSWORD via the setup wizard or a local .env file}"

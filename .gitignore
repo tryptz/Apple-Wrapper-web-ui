@@ -1,0 +1,27 @@
+# ─── Credentials / session state ──────────────────────────────────────
+# rootfs/data holds a SIGNED-IN Apple Music session: MUSIC_TOKEN, the
+# cookies/accounts/kvs sqlite DBs, IC-Info.sids and fsi.pdat. These are
+# per-user secrets and must never be committed.
+rootfs/data/
+
+# ─── Proprietary runtime ──────────────────────────────────────────────
+# ~118 MB of Android system libraries extracted from the Apple Music APK
+# and an Android image. Not ours to redistribute, and far too large for a
+# git repo. Provide these locally — see README.
+rootfs/system/
+
+# ─── Downloaded audio ─────────────────────────────────────────────────
+# Ripped tracks + cover art. Multi-GB and copyrighted.
+downloads/
+
+# ─── Build output ─────────────────────────────────────────────────────
+build/
+node_modules/
+
+# ─── Local tooling / OS noise ─────────────────────────────────────────
+.claude/settings.local.json
+*.log
+.env
+.DS_Store
+Thumbs.db
+desktop.ini
