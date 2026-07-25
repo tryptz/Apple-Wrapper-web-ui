@@ -4,9 +4,26 @@
 // containers. Run:  node webui/server.js   then open http://localhost:8080
 
 const http = require('http');
+const https = require('https');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
+// ── Two run modes ───────────────────────────────────────────────────────────
+//
+// LOCAL (default): this process has a Docker daemon. It drives the wrapper and
+// downloader containers directly — the original behaviour.
+//
+// PROXY (AGENT_URL set): this process has NO Docker — e.g. it is the Railway
+// service. It serves the UI and forwards every /api and /files request to a
+// LOCAL-mode instance running on your own machine, reached over Tailscale.
+// Nothing is reimplemented: the agent stays the single place that knows how to
+// talk to Docker, so both modes expose exactly the same API surface.
+//
+//   AGENT_URL=http://<your-agent-host>:8080     (tailnet IP, or a MagicDNS name)
+//
+const AGENT_URL = (process.env.AGENT_URL || '').replace(/\/+$/, '');
+const PROXY_MODE = AGENT_URL !== '';
 
 const PORT = process.env.PORT || 8080;
 const ROOT = path.join(__dirname, '..');            // the wrapper repo root
@@ -141,6 +158,69 @@ async function startWrapper(username, password) {
   // exactly one wrapper instance. Credentials flow in via the environment and
   // are interpolated by compose.yaml.
   return composeRun(['up', '-d', COMPOSE_SERVICE], { USERNAME: username, PASSWORD: password });
+}
+
+// ---- proxy mode ------------------------------------------------------------
+
+// Stream a request through to the agent. Piping both directions keeps Server-
+// Sent Events working unbuffered, so live wrapper/download logs still tail in
+// real time across the tailnet.
+function proxyToAgent(req, res) {
+  let target;
+  try {
+    target = new URL(req.url, AGENT_URL);
+  } catch {
+    return sendJSON(res, 500, { error: `AGENT_URL is not a valid URL: ${AGENT_URL}` });
+  }
+
+  const mod = target.protocol === 'https:' ? https : http;
+  const headers = { ...req.headers, host: target.host };
+  // Never let a proxied response arrive compressed — it would break the SSE
+  // framing we pipe straight through.
+  delete headers['accept-encoding'];
+
+  const upstream = mod.request(
+    target,
+    { method: req.method, headers },
+    (up) => {
+      res.writeHead(up.statusCode || 502, up.headers);
+      up.pipe(res);
+    },
+  );
+
+  upstream.setTimeout(0);           // long-lived SSE streams must not time out
+  upstream.on('error', (err) => {
+    if (res.headersSent) return res.end();
+    sendJSON(res, 502, {
+      error:
+        `Cannot reach the wrapper agent at ${AGENT_URL} (${err.code || err.message}). ` +
+        `Check that the agent is running on your machine and that this service is on the tailnet.`,
+    });
+  });
+  req.on('aborted', () => upstream.destroy());
+  req.pipe(upstream);
+}
+
+// Cheap reachability probe used by the setup wizard in proxy mode.
+function agentHealth() {
+  return new Promise((resolve) => {
+    let target;
+    try { target = new URL('/api/status', AGENT_URL); }
+    catch { return resolve({ ok: false, detail: `AGENT_URL is malformed: ${AGENT_URL}` }); }
+
+    const mod = target.protocol === 'https:' ? https : http;
+    const rq = mod.request(target, { method: 'GET', timeout: 4000 }, (up) => {
+      up.resume();
+      resolve(
+        up.statusCode === 200
+          ? { ok: true, detail: `Agent reachable at ${AGENT_URL}` }
+          : { ok: false, detail: `Agent responded ${up.statusCode} at ${AGENT_URL}` },
+      );
+    });
+    rq.on('timeout', () => { rq.destroy(); resolve({ ok: false, detail: `Timed out reaching ${AGENT_URL}` }); });
+    rq.on('error', (e) => resolve({ ok: false, detail: `${e.code || e.message} — ${AGENT_URL}` }));
+    rq.end();
+  });
 }
 
 // ---- onboarding / setup ----------------------------------------------------
@@ -293,12 +373,51 @@ const server = http.createServer(async (req, res) => {
       return res.end(html);
     }
 
+    // Proxy mode: everything with side effects belongs to the agent. This must
+    // sit ahead of every Docker-backed route below — there is no daemon here.
+    // /api/setup/state is handled locally (it describes the link itself).
+    if (PROXY_MODE && p !== '/api/setup/state' && (p.startsWith('/api/') || p.startsWith('/files/'))) {
+      return proxyToAgent(req, res);
+    }
+
     if (p === '/api/status' && req.method === 'GET') {
       return sendJSON(res, 200, await wrapperStatus());
     }
 
+    // In proxy mode the setup checklist describes THIS hop (can we reach the
+    // agent?) plus whatever the agent reports about its own Docker/session
+    // state — so the wizard still tells the whole truth end to end.
+    if (p === '/api/setup/state' && req.method === 'GET' && PROXY_MODE) {
+      const link = await agentHealth();
+      let remote = null;
+      if (link.ok) {
+        remote = await new Promise((resolve) => {
+          const t = new URL('/api/setup/state', AGENT_URL);
+          const mod = t.protocol === 'https:' ? https : http;
+          const rq = mod.request(t, { timeout: 5000 }, (up) => {
+            let b = '';
+            up.on('data', (d) => (b += d));
+            up.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } });
+          });
+          rq.on('timeout', () => { rq.destroy(); resolve(null); });
+          rq.on('error', () => resolve(null));
+          rq.end();
+        });
+      }
+      const steps = {
+        agent: { ok: link.ok, detail: link.detail },
+        ...(remote ? remote.steps : {}),
+      };
+      return sendJSON(res, 200, {
+        ready: link.ok && !!remote && remote.ready,
+        mode: 'proxy',
+        steps,
+        wrapper: remote ? remote.wrapper : { running: false, listening: false },
+      });
+    }
+
     if (p === '/api/setup/state' && req.method === 'GET') {
-      return sendJSON(res, 200, await setupState());
+      return sendJSON(res, 200, { ...(await setupState()), mode: 'local' });
     }
 
     // First-time sign-in. Identical mechanics to /api/wrapper/start — the
@@ -419,5 +538,11 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Apple Music web UI running at http://localhost:${PORT}`);
-  console.log(`Repo root: ${ROOT}`);
+  if (PROXY_MODE) {
+    console.log(`Mode: PROXY — forwarding /api and /files to ${AGENT_URL}`);
+    console.log('No Docker is used by this process; the agent does the work.');
+  } else {
+    console.log('Mode: LOCAL — driving Docker directly');
+    console.log(`Repo root: ${ROOT}`);
+  }
 });

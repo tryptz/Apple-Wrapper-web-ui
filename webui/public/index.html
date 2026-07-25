@@ -112,6 +112,14 @@
     background: #24242c; color: var(--muted);
   }
   .pill.ok { background: rgba(51,194,106,.15); color: var(--ok); }
+
+  .banner {
+    grid-column: 1 / -1; padding: 11px 14px; border-radius: 9px;
+    font-size: 13px; border: 1px solid var(--line); background: #14141a;
+  }
+  .banner.no   { border-left: 3px solid var(--accent); color: #f3c9cf; }
+  .banner.warn { border-left: 3px solid var(--warn);   color: #f0dcb4; }
+  .banner.ok   { border-left: 3px solid var(--ok);     color: #c6ecd4; }
 </style>
 </head>
 <body>
@@ -170,7 +178,9 @@
 
 <main>
   <!-- Credentials / wrapper -->
-  <section class="card">
+  <div id="banner" class="banner" style="display:none"></div>
+
+  <section class="card" id="acctCard">
     <h2>1 · Wrapper service</h2>
 
     <!-- With a saved session no credentials are needed to start. -->
@@ -259,37 +269,60 @@ function streamInto(sseUrl, el, { clear = true } = {}) {
 
 // Extra guidance the server can't infer — what to actually DO about a red check.
 const FIXES = {
+  agent: 'Start the agent on your own machine (node webui/server.js) and make sure both it and this service are on the same tailnet. Then check AGENT_URL points at that machine, e.g. http://100.x.y.z:8080',
   docker: 'Install Docker Desktop from docker.com, launch it, and wait for the whale icon to settle.',
   compose: 'Bundled with Docker Desktop. On Linux: sudo apt install docker-compose-plugin',
   rootfs: 'Copy your extracted Android runtime into rootfs/system/ — it must contain bin/linker64 and lib64/libandroidappmusic.so. It is not redistributed with this repo.',
+};
+
+// In proxy mode the docker/rootfs checks describe the AGENT's machine, not the
+// browser's — label them so the distinction is obvious.
+const LABELS = {
+  local: {
+    agent: 'Wrapper agent',
+    docker: 'Docker running',
+    compose: 'Docker Compose available',
+    rootfs: 'Android runtime (rootfs/system)',
+    session: 'Apple Music session',
+  },
+  proxy: {
+    agent: 'Tailnet link to your agent',
+    docker: 'Docker running (on agent)',
+    compose: 'Docker Compose available (on agent)',
+    rootfs: 'Android runtime (on agent)',
+    session: 'Apple Music session (on agent)',
+  },
 };
 
 let setupReady = false;
 let hasSession = false;
 
 function renderChecks(state) {
-  const order = [
-    ['docker', 'Docker running'],
-    ['compose', 'Docker Compose available'],
-    ['rootfs', 'Android runtime (rootfs/system)'],
-    ['session', 'Apple Music session'],
-  ];
-  $('checks').innerHTML = order.map(([key, label]) => {
+  const mode = state.mode || 'local';
+  const labels = LABELS[mode];
+  const order = mode === 'proxy'
+    ? ['agent', 'docker', 'rootfs', 'session']
+    : ['docker', 'compose', 'rootfs', 'session'];
+
+  $('checks').innerHTML = order.map((key) => {
     const s = state.steps[key];
+    if (!s) return '';   // agent unreachable ⇒ its sub-checks are unknown
     const fix = !s.ok && FIXES[key] ? `<code>${FIXES[key]}</code>` : '';
     return `<div class="check">
       <div class="mark ${s.ok ? 'ok' : 'no'}">${s.ok ? '✓' : '!'}</div>
       <div class="body">
-        <div class="title">${label}</div>
+        <div class="title">${labels[key]}</div>
         <div class="detail">${s.detail}</div>${fix}
       </div>
     </div>`;
   }).join('');
 
-  // Only offer sign-in once the prerequisites it depends on are satisfied —
-  // otherwise the login will fail for reasons unrelated to the password.
-  const prereqs = state.steps.docker.ok && state.steps.compose.ok && state.steps.rootfs.ok;
-  $('signinBlock').style.display = (prereqs && !state.steps.session.ok) ? 'block' : 'none';
+  // Sign-in belongs to whoever owns the credentials. In proxy mode that's the
+  // agent on your own machine, never this browser — so never offer it here.
+  const st = state.steps;
+  const prereqs = mode === 'local'
+    && st.docker && st.docker.ok && st.compose && st.compose.ok && st.rootfs && st.rootfs.ok;
+  $('signinBlock').style.display = (prereqs && st.session && !st.session.ok) ? 'block' : 'none';
 
   $('wizState').textContent = state.ready ? 'ready' : 'setup incomplete';
   $('wizState').className = 'pill' + (state.ready ? ' ok' : '');
@@ -301,19 +334,56 @@ async function refreshSetup({ autoOpen = false } = {}) {
   try { state = await (await fetch('/api/setup/state')).json(); }
   catch { return; }
 
+  const mode = state.mode || 'local';
   setupReady = state.ready;
-  hasSession = state.steps.session.ok;
+  hasSession = !!(state.steps.session && state.steps.session.ok);
 
   renderChecks(state);
 
-  // Main-app affordances that depend on having a session.
+  if (mode === 'proxy') {
+    // Remote control only: the agent on your machine owns Docker, the wrapper
+    // and the credentials. Strip this UI down to paste-link → format →
+    // download and just report whether the far end is ready.
+    $('acctCard').style.display = 'none';
+    $('setupBtn').textContent = 'Diagnostics';
+
+    const agentOk = state.steps.agent && state.steps.agent.ok;
+    const wrapperUp = state.wrapper && state.wrapper.listening;
+
+    let msg = '', tone = 'ok';
+    if (!agentOk) {
+      msg = 'Your PC agent is offline — start it there, then reload.'; tone = 'no';
+    } else if (!hasSession) {
+      msg = 'Agent online, but it has no Apple Music session. Sign in on your PC.'; tone = 'no';
+    } else if (!wrapperUp) {
+      msg = 'Agent online. Start the wrapper on your PC to enable downloads.'; tone = 'warn';
+    }
+    $('banner').style.display = msg ? 'block' : 'none';
+    $('banner').textContent = msg;
+    $('banner').className = 'banner ' + tone;
+
+    // Downloads only make sense once the far end can actually serve them.
+    const ready = agentOk && hasSession && wrapperUp;
+    $('dlBtn').disabled = !ready;
+
+    $('acctPill').style.display = 'inline-block';
+    $('acctPill').textContent = ready ? 'agent ready' : (agentOk ? 'agent online' : 'agent offline');
+    $('acctPill').className = 'pill' + (ready ? ' ok' : '');
+
+    // Never nag on load here — a down agent is shown by the banner instead.
+    if (autoOpen && !agentOk) $('setup').classList.add('show');
+    return state;
+  }
+
+  // ── local mode: full control surface ──
+  $('acctCard').style.display = '';
   $('haveSession').style.display = hasSession ? 'block' : 'none';
   $('needSession').style.display = hasSession ? 'none' : 'block';
   $('acctPill').style.display = hasSession ? 'inline-block' : 'none';
   $('acctPill').textContent = 'session active';
   $('acctPill').className = 'pill ok';
+  $('banner').style.display = 'none';
 
-  // Show the wizard unprompted only on a genuinely unfinished setup.
   if (autoOpen && !state.ready) $('setup').classList.add('show');
   return state;
 }
