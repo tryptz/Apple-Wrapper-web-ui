@@ -1,0 +1,18 @@
+# Railway upload rules. Takes precedence over .gitignore for `railway up`.
+#
+# The key difference from .gitignore: rootfs/system/ IS uploaded here. Those
+# ~115 MB of Android runtime libraries can't live in git (proprietary, huge),
+# but the wrapper container is useless without them, so they ride along in the
+# build context on deploy instead.
+#
+# rootfs/data/ stays excluded — that's the signed-in session, and it must never
+# be baked into an image. On Railway the wrapper mints its own session at
+# runtime from the USERNAME/PASSWORD service variables onto a mounted volume.
+
+rootfs/data/
+downloads/
+node_modules/
+.git/
+.claude/
+*.log
+.env

@@ -15,13 +15,13 @@ RUN if [[ -f ./wrapper ]]; then \
         touch /use_prebuild; \
     fi
 
-# NOTE: `id=` is required by some BuildKit frontends (Railway's Metal builder
-# rejects an id-less cache mount outright: "missing an id argument"). Local
-# docker buildx derives an id from the target, so naming them is harmless here
-# and portable there.
-RUN --mount=type=cache,id=apt-lib,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
-    if [[ ! -f /use_prebuild ]]; then \
+# No BuildKit cache mounts here. They were only an apt-download optimisation
+# for the from-source path, which is skipped entirely whenever a prebuilt
+# `wrapper` binary is present (the normal case). Hosted BuildKit frontends
+# also impose their own rules on cache-mount ids — Railway's Metal builder
+# rejects both an id-less mount and an id without its cacheKey prefix — so
+# dropping them keeps this Dockerfile portable across builders.
+RUN if [[ ! -f /use_prebuild ]]; then \
         apt-get update; \
         apt-get install -y \
             build-essential \
