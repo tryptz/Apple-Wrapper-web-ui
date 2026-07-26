@@ -562,7 +562,7 @@ const RETRY_LOOP_MARKER = /Error detected, press Enter to try again|Start trying
 const RETRY_LOOP_LIMIT = 3;          // strikes before we call it stuck
 const JOB_MAX_MS = 30 * 60_000;      // absolute ceiling per job
 
-function startDownload(url, format) {
+function startDownload(url, format, { outDir } = {}) {
   const id = String(++jobSeq);
   // jobSeq restarts at 1 whenever the agent restarts, so `am-dl-<id>` alone
   // collides with a container left over from a previous run ("name is already
@@ -570,9 +570,12 @@ function startDownload(url, format) {
   // restarts and concurrent users.
   const name = `am-dl-${id}-${RUN_TAG}`;
   const flags = FORMAT_FLAGS[format] || [];
+  // Tryptify's per-track decrypts mount their own directory so the finished
+  // file can be found by adamId alone; normal UI downloads use the shared one.
+  const mount = outDir || DOWNLOADS_DIR;
   const args = [
     'run', '--rm', '--network', 'host', '--name', name,
-    '-v', `${DOWNLOADS_DIR}:/downloads`,
+    '-v', `${mount}:/downloads`,
     DL_IMAGE,
     ...flags,
     url,
@@ -627,6 +630,107 @@ function startDownload(url, format) {
     for (const c of job.clients) sseSend(c, 'done', { code: -1 });
   });
   return job;
+}
+
+// ---- Tryptify agent API -----------------------------------------------------
+//
+// The Tryptify Android app can play Apple Music straight off this machine over
+// Tailscale, with no cloud hop. Its contract (HiFiApiClient.getAppleStreamUrl):
+//
+//   POST /decrypt              {"adamId":"…","quality":"…"}  + X-Agent-Secret
+//   GET  /files/<adamId>.m4a   polled with Range: bytes=0-0 until 200/206,
+//                              then used directly as the playback URL.
+//
+// Each track decrypts into its own directory keyed by adamId, because the
+// downloader names output after artist/album/track and the app only knows the
+// numeric id - a per-id directory is what makes the lookup possible at all.
+
+const AGENT_SECRET = process.env.AGENT_SECRET || '';   // optional
+const APPLE_DIR = path.join(DOWNLOADS_DIR, '_agent');
+
+const appleJobs = new Map();   // adamId -> { started, jobId }
+
+function appleTrackDir(adamId) {
+  return path.join(APPLE_DIR, String(adamId));
+}
+
+/**
+ * The finished audio for this adamId, or null while it is still decrypting.
+ * The downloader writes a nested tree - <format>/<artist>/<album>/<track>.m4a -
+ * so this walks recursively rather than assuming a flat directory. Partial
+ * files are skipped: a zero-byte file exists well before it is playable, and
+ * returning it would make the app start streaming a truncated track.
+ */
+function findAppleFile(adamId) {
+  const dir = appleTrackDir(adamId);
+  if (!fs.existsSync(dir)) return null;
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); }
+    catch { return null; }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        const hit = walk(full);
+        if (hit) return hit;
+      } else if (/\.(m4a|mp4|flac)$/i.test(e.name)) {
+        try { if (fs.statSync(full).size > 0) return full; } catch { /* mid-write */ }
+      }
+    }
+    return null;
+  };
+  return walk(dir);
+}
+
+function startAppleDecrypt(adamId, quality) {
+  const existing = appleJobs.get(String(adamId));
+  if (existing && jobs.get(existing.jobId) && !jobs.get(existing.jobId).done) {
+    return { already: true, id: existing.jobId };
+  }
+  const outDir = appleTrackDir(adamId);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  // A bare song id is enough for the downloader; the slug is cosmetic.
+  const url = `https://music.apple.com/us/song/track/${adamId}`;
+  const format = quality === 'atmos' ? 'atmos' : (quality === 'aac' ? 'aac' : 'alac');
+
+  const job = startDownload(url, format, { outDir });
+  appleJobs.set(String(adamId), { started: Date.now(), jobId: job.id });
+  return { already: false, id: job.id };
+}
+
+/** Serve a file with byte-range support - required for seeking, and for the
+ *  app's `Range: bytes=0-0` readiness probe. */
+function serveFileRanged(req, res, full) {
+  const stat = fs.statSync(full);
+  const range = req.headers.range;
+  const type = /\.flac$/i.test(full) ? 'audio/flac' : 'audio/mp4';
+
+  if (!range) {
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Content-Length': stat.size,
+      'Accept-Ranges': 'bytes',
+    });
+    return fs.createReadStream(full).pipe(res);
+  }
+
+  const m = /bytes=(\d*)-(\d*)/.exec(range);
+  let start = m && m[1] ? parseInt(m[1], 10) : 0;
+  let end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+  if (Number.isNaN(start) || start < 0) start = 0;
+  if (Number.isNaN(end) || end >= stat.size) end = stat.size - 1;
+  if (start > end) {
+    res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+    return res.end();
+  }
+  res.writeHead(206, {
+    'Content-Type': type,
+    'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+    'Content-Length': end - start + 1,
+    'Accept-Ranges': 'bytes',
+  });
+  return fs.createReadStream(full, { start, end }).pipe(res);
 }
 
 // ---- downloaded file listing ----------------------------------------------
@@ -689,7 +793,8 @@ const server = http.createServer(async (req, res) => {
     // Proxy mode: everything with side effects belongs to the agent. This must
     // sit ahead of every Docker-backed route below — there is no daemon here.
     // /api/setup/state is handled locally (it describes the link itself).
-    if (PROXY_MODE && p !== '/api/setup/state' && (p.startsWith('/api/') || p.startsWith('/files/'))) {
+    if (PROXY_MODE && p !== '/api/setup/state'
+        && (p.startsWith('/api/') || p.startsWith('/files/') || p === '/decrypt')) {
       return proxyToAgent(req, res);
     }
 
@@ -837,6 +942,48 @@ const server = http.createServer(async (req, res) => {
       const job = jobs.get(id);
       if (job) await dockerRun(['rm', '-f', job.name]);
       return sendJSON(res, 200, { ok: true });
+    }
+
+    // ---- Tryptify agent API ----
+    // Kick off a decrypt for one Apple track. Idempotent: asking again while
+    // it is already running (or already finished) does not start a second
+    // container - the app polls, so repeats are expected, and duplicates would
+    // each hold their own Apple stream.
+    if (p === '/decrypt' && req.method === 'POST') {
+      if (AGENT_SECRET && req.headers['x-agent-secret'] !== AGENT_SECRET) {
+        return sendJSON(res, 403, { error: 'Bad agent secret' });
+      }
+      const { adamId, quality } = await readBody(req);
+      if (!adamId || !/^\d+$/.test(String(adamId))) {
+        return sendJSON(res, 400, { error: 'adamId (numeric) required' });
+      }
+      if (findAppleFile(adamId)) {
+        return sendJSON(res, 200, { ok: true, ready: true });
+      }
+      const r = startAppleDecrypt(adamId, String(quality || 'alac'));
+      return sendJSON(res, 202, { ok: true, ready: false, job: r.id, already: r.already });
+    }
+
+    // Serve a decrypted track by adamId. 404 until it exists - the app treats
+    // anything other than 200/206 as "still working" and keeps polling.
+    const appleFile = /^\/files\/(\d+)\.m4a$/.exec(p);
+    if (appleFile && (req.method === 'GET' || req.method === 'HEAD')) {
+      if (AGENT_SECRET && req.headers['x-agent-secret'] &&
+          req.headers['x-agent-secret'] !== AGENT_SECRET) {
+        return sendJSON(res, 403, { error: 'Bad agent secret' });
+      }
+      const full = findAppleFile(appleFile[1]);
+      if (!full) return sendJSON(res, 404, { error: 'Not ready' });
+      if (req.method === 'HEAD') {
+        const st = fs.statSync(full);
+        res.writeHead(200, {
+          'Content-Type': 'audio/mp4',
+          'Content-Length': st.size,
+          'Accept-Ranges': 'bytes',
+        });
+        return res.end();
+      }
+      return serveFileRanged(req, res, full);
     }
 
     if (p === '/api/files' && req.method === 'GET') {
