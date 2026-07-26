@@ -616,18 +616,29 @@ function startDownload(url, format, { outDir } = {}) {
   const onData = (d) => String(d).split(/\r?\n/).forEach((l) => l !== '' && push(l));
   p.stdout.on('data', onData);
   p.stderr.on('data', onData);
+  // Fired once the process is gone, whatever the outcome. Used by the Apple
+  // path to retry a different format when the requested one yielded nothing.
+  const finished = () => {
+    if (typeof job.onFinished !== 'function') return;
+    const fn = job.onFinished;
+    job.onFinished = null;                  // never run twice
+    try { fn(); } catch (e) { push(`ERROR in onFinished: ${e}`); }
+  };
+
   p.on('close', (code) => {
     clearTimeout(killTimer);
     job.done = true;
     job.code = code;
     push(job.killed ? `\n=== job stopped: ${job.killed} ===` : `\n=== job finished (exit ${code}) ===`);
     for (const c of job.clients) sseSend(c, 'done', { code, killed: job.killed || null });
+    finished();
   });
   p.on('error', (err) => {
     job.done = true;
     job.code = -1;
     push(`ERROR: ${err}`);
     for (const c of job.clients) sseSend(c, 'done', { code: -1 });
+    finished();
   });
   return job;
 }
@@ -654,14 +665,32 @@ function appleTrackDir(adamId) {
   return path.join(APPLE_DIR, String(adamId));
 }
 
+/** True while this adamId's decrypt job is still running. */
+function appleJobRunning(adamId) {
+  const entry = appleJobs.get(String(adamId));
+  if (!entry) return false;                 // nothing started, or lost to a restart
+  const job = jobs.get(entry.jobId);
+  return !!job && !job.done;
+}
+
+// A file written this recently is treated as still settling. Covers what the
+// job map cannot: an agent restart orphans a half-written file, so no job
+// exists to ask about even though the bytes are incomplete.
+const APPLE_SETTLE_MS = 2000;
+
 /**
  * The finished audio for this adamId, or null while it is still decrypting.
  * The downloader writes a nested tree - <format>/<artist>/<album>/<track>.m4a -
- * so this walks recursively rather than assuming a flat directory. Partial
- * files are skipped: a zero-byte file exists well before it is playable, and
- * returning it would make the app start streaming a truncated track.
+ * so this walks recursively rather than assuming a flat directory.
+ *
+ * Readiness is gated on the JOB being done, not on the file merely existing.
+ * size > 0 was far too weak: the downloader streams into the final path, so the
+ * file is non-empty for seconds before it is complete. The app polls this
+ * endpoint and starts transferring the moment it says yes, so it was handed an
+ * M4A truncated mid-mdat - present, ~90% of full size, and undecodable.
  */
 function findAppleFile(adamId) {
+  if (appleJobRunning(adamId)) return null;
   const dir = appleTrackDir(adamId);
   if (!fs.existsSync(dir)) return null;
   const walk = (d) => {
@@ -674,7 +703,10 @@ function findAppleFile(adamId) {
         const hit = walk(full);
         if (hit) return hit;
       } else if (/\.(m4a|mp4|flac)$/i.test(e.name)) {
-        try { if (fs.statSync(full).size > 0) return full; } catch { /* mid-write */ }
+        try {
+          const st = fs.statSync(full);
+          if (st.size > 0 && Date.now() - st.mtimeMs >= APPLE_SETTLE_MS) return full;
+        } catch { /* mid-write */ }
       }
     }
     return null;
@@ -682,7 +714,24 @@ function findAppleFile(adamId) {
   return walk(dir);
 }
 
-function startAppleDecrypt(adamId, quality) {
+/** Map a requested quality onto a downloader format code. */
+function appleFormatFor(quality) {
+  if (quality === 'atmos') return 'atmos';
+  if (quality === 'aac') return 'aac';
+  if (quality === 'hires-lossless') return 'alac';   // downloader has one ALAC tier
+  return 'alac';
+}
+
+/**
+ * Kick a decrypt for one adamId.
+ *
+ * `fallback` handles the Atmos case: most tracks have no Atmos master, and the
+ * job simply finishes having produced nothing. Retrying here is what keeps that
+ * cheap — the app is polling /files and cannot tell "still working" from "there
+ * is no Atmos version", so if it had to time out first it would wait the full
+ * 210s before trying stereo. We see the exit and start the stereo job at once.
+ */
+function startAppleDecrypt(adamId, quality, fallback) {
   const existing = appleJobs.get(String(adamId));
   if (existing && jobs.get(existing.jobId) && !jobs.get(existing.jobId).done) {
     return { already: true, id: existing.jobId };
@@ -692,11 +741,42 @@ function startAppleDecrypt(adamId, quality) {
 
   // A bare song id is enough for the downloader; the slug is cosmetic.
   const url = `https://music.apple.com/us/song/track/${adamId}`;
-  const format = quality === 'atmos' ? 'atmos' : (quality === 'aac' ? 'aac' : 'alac');
+  const format = appleFormatFor(quality);
 
   const job = startDownload(url, format, { outDir });
   appleJobs.set(String(adamId), { started: Date.now(), jobId: job.id });
+
+  if (fallback && fallback !== quality) {
+    job.onFinished = () => {
+      // Ask the walker directly (not findAppleFile) so the settle delay and the
+      // still-running check don't mask a genuine "nothing was produced".
+      if (appleProducedFile(adamId)) return;
+      console.log(`[apple] ${adamId}: ${format} produced nothing - retrying as ${appleFormatFor(fallback)}`);
+      appleJobs.delete(String(adamId));
+      startAppleDecrypt(adamId, fallback, null);
+    };
+  }
   return { already: false, id: job.id };
+}
+
+/** Any audio file under this adamId's dir, regardless of age or job state. */
+function appleProducedFile(adamId) {
+  const dir = appleTrackDir(adamId);
+  if (!fs.existsSync(dir)) return false;
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); }
+    catch { return false; }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) { if (walk(full)) return true; }
+      else if (/\.(m4a|mp4|flac)$/i.test(e.name)) {
+        try { if (fs.statSync(full).size > 0) return true; } catch { /* ignore */ }
+      }
+    }
+    return false;
+  };
+  return walk(dir);
 }
 
 /** Serve a file with byte-range support - required for seeking, and for the
@@ -953,14 +1033,21 @@ const server = http.createServer(async (req, res) => {
       if (AGENT_SECRET && req.headers['x-agent-secret'] !== AGENT_SECRET) {
         return sendJSON(res, 403, { error: 'Bad agent secret' });
       }
-      const { adamId, quality } = await readBody(req);
+      // `fallback` is optional: the format to retry with if `quality` produces
+      // nothing. The app sets it to its stereo choice when asking for atmos,
+      // since most tracks have no Atmos master.
+      const { adamId, quality, fallback } = await readBody(req);
       if (!adamId || !/^\d+$/.test(String(adamId))) {
         return sendJSON(res, 400, { error: 'adamId (numeric) required' });
       }
       if (findAppleFile(adamId)) {
         return sendJSON(res, 200, { ok: true, ready: true });
       }
-      const r = startAppleDecrypt(adamId, String(quality || 'alac'));
+      const r = startAppleDecrypt(
+        adamId,
+        String(quality || 'alac'),
+        fallback ? String(fallback) : null,
+      );
       return sendJSON(res, 202, { ok: true, ready: false, job: r.id, already: r.already });
     }
 
